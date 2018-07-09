@@ -1,0 +1,10 @@
+#PBS -N SKAT
+#PBS -q batch
+#PBS -l nodes=1:ppn=1
+#PBS -j oe
+#PBS -t 1-24175
+
+cd $HOME/POCRE
+if [ ! -f skat/test_${PBS_ARRAYID}.tsv ]; then
+	Rscript SKAT.R ${PBS_ARRAYID}
+fi
