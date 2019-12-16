@@ -1,36 +1,37 @@
 library(SKAT)
-
-argv <- commandArgs(T)
-n <- argv[1]
-#p <- 0.05
-p <- 0.01
-
-cmd <- paste0('./src/plink --memory 100 --vcf vcf/filtered_665_accession_snp_maf0.01_gene.pos.select.', p, '.ensembl.vcf.gz --pheno geo/gene_expression_pheno.tsv --mpheno ', n, ' --make-bed --out plink/test_', n)
-system(cmd)
+library(doParallel)
+registerDoParallel(core=40)
 
 # Generate SSD file
-File.Bed <- paste0('plink/test_', n, '.bed')
-File.Bim <- paste0('plink/test_', n, '.bim')
-File.Fam <- paste0('plink/test_', n, '.fam')
-File.SetID <- paste0('tair10_gene.SetID.', p)
-File.SSD <- paste0('plink/test_', n, '.SSD')
-File.Info <- paste0('plink/test_', n, '.SSD.info')
-
+File.Bed <- 'plink/SNP_candidates.bed'
+File.Bim <- 'plink/SNP_candidates.bim'
+File.Fam <- 'plink/SNP_candidates.fam'
+File.SetID <- 'snp/SNP_candidates.SetID'
+File.SSD <- 'plink/SNP_candidates.SSD'
+File.Info <- 'plink/SNP_candidates.SSD.info'
 Generate_SSD_SetID(File.Bed, File.Bim, File.Fam, File.SetID, File.SSD, File.Info)
 
-# open SSD and Info file and run SKAT
-FAM <- Read_Plink_FAM(File.Fam, Is.binary = FALSE)
 
-y <- FAM$Phenotype
+fam_files <- dir('plink/fam/', full.names = T)
+genes <- sub('.fam', '', dir('plink/fam'))
 
-SSD.INFO <- Open_SSD(File.SSD, File.Info)
+writeLines(c(""), "SKAT_log.txt")
+st <- system.time({
+  results <- foreach(i=1:length(fam_files), .verbose = F) %dopar% {
+    cat(paste("Starting iteration", i, "\n"), file = 'SKAT_log.txt', append = TRUE)
+    
+    y <- Read_Plink_FAM(fam_files[i], Is.binary = FALSE)$Phenotype
+    obj <- SKAT_Null_Model(y ~ 1, out_type = 'C')
+    
+    # open SSD and Info file and run SKAT
+    SSD.INFO <- Open_SSD(File.SSD, File.Info)
+    out <- SKAT.SSD.All(SSD.INFO, obj)
+    Close_SSD()
 
-obj <- SKAT_Null_Model(y ~ 1, out_type = 'C')
+    out$results$transcript <- genes[i] 
+    out$results
+  }
+})
 
-out <- SKAT.SSD.All(SSD.INFO, obj)
 
-write.table(out$results, paste0('skat/test_', n, '.tsv'), row.names = F, sep = '\t', quote = F)
-
-Close_SSD()
-
-system(paste0('rm plink/test_', n, '.*'))
+save(list = c('st', 'results'), file = 'RData/SKAT.RData')

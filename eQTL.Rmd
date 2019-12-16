@@ -1,0 +1,389 @@
+---
+title: "Workflow of eQTL identification"
+author:
+- Fu Xing^[bio.xfu@qq.com]
+output: 
+  html_notebook:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    theme: flatly
+---
+
+# Datasets and Preprocessing
+
+> The SNP datasets for different Arabidopsis accessions were downloaded from the [1001 Genomes project website](http://1001genomes.org/data/GMI-MPI/releases/v3.1/). 
+
+```{bash}
+# download the accession number list
+mkdir vcf
+wget http://1001genomes.org/data/GMI-MPI/releases/v3.1/intersection_snp_short_indel_vcf/ -P vcf
+grep 'vcf.gz' vcf/index.html|sed -r 's/.+"intersection_//'|sed -r 's/\.vcf.+//'|sort -n > vcf/vcf_accession_list
+```
+
+> Gene expression data for different accessions were downloaded from [GEO:GSE80744](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE80744). The expression levels are based on RNA-seq and were quantile normalized by Kawakatsu et al., and then the normalized expression levels were transformed with base 2 log.
+
+```{bash}
+# download the normalized expression data from GEO
+mkdir geo
+wget ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE80nnn/GSE80744/suppl/GSE80744_ath1001_tx_norm_2016-04-21-UQ_gNorm_normCounts_k4.tsv.gz -P geo
+zcat geo/GSE80744_ath1001_tx_norm_2016-04-21-UQ_gNorm_normCounts_k4.tsv.gz > geo/GSE80744_ath1001_tx_norm_2016-04-21-UQ_gNorm_normCounts_k4.tsv
+
+# find 665 accessions with both VCF and GEO data
+cat geo/GSE80744_ath1001_tx_norm_2016-04-21-UQ_gNorm_normCounts_k4.tsv |head -1|sed 's/X//g'|sed -r 's/\t/\n/g'|grep -v 'gene' > geo/geo_accessions_list
+cat vcf/vcf_accession_list geo/geo_accessions_list|sort -n|uniq -d > 665_accession
+```
+
+```{r}
+# preprocess_gene_expression.R
+geo <- read.table('geo/GSE80744_ath1001_tx_norm_2016-04-21-UQ_gNorm_normCounts_k4.tsv', header = T, row.names = 1)
+colnames(geo) <- sub('X', '', colnames(geo))
+acc <- read.table('665_accession')$V1
+
+geo2 <- round(log2(geo[, colnames(geo) %in% c('gene_id', acc)] + 1), 2)
+write.table(geo2, 'geo/gene_expression.tsv', quote=F, sep='\t', col.names = NA)
+
+geo_pheno <- data.frame(FID=colnames(geo2),
+                        IID=colnames(geo2),
+                        t(geo2))
+write.table(geo_pheno, 'geo/gene_expression_pheno.tsv', quote=F, sep='\t', row.names = FALSE)
+```
+
+> Select SNPs which locate in the genes with minor allele frequency threshold 0.01.
+
+```{bash}
+# extract SNPs (MAF>0.01) within genes in 665 accession from VCF file
+wget -c http://1001genomes.org/data/GMI-MPI/releases/v3.1/1001genomes_snp-short-indel_only_ACGTN.vcf.gz -P vcf
+bcftools index -t vcf/1001genomes_snp-short-indel_only_ACGTN.vcf.gz
+
+# get total variant count of all accessions
+bcftools index --nrecords vcf/1001genomes_snp-short-indel_only_ACGTN.vcf.gz 
+# get variant count per chromsome of all accessions
+bcftools index --stats vcf/1001genomes_snp-short-indel_only_ACGTN.vcf.gz
+
+vcftools --gzvcf vcf/1001genomes_snp-short-indel_only_ACGTN.vcf.gz --keep 665_accession --remove-indels --maf 0.01 --bed tair10_gene_28775.bed --recode --recode-INFO-all --stdout | bgzip -c > vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz
+
+bcftools index -t vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz
+# get total variant count
+bcftools index --nrecords vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz 
+# get variant count per chromsome
+bcftools index --stats vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz 
+
+## generate SNP matrix
+vcftools --gzvcf vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz --012 --out vcf/filtered_665_accession_snp_maf0.01_gene_matrix
+```
+
+# POCRE and SKAT
+```{bash}
+# install PLINK 
+mkdir bin
+wget -c http://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20191130.zip
+unzip plink_linux_x86_64_20191130.zip -d bin
+
+# install POCRE
+wget -c http://www.stat.purdue.edu/~zhangdb/packages/POCRE/POCRE_0.1.0.tar.gz
+R CMD INSTALL POCRE_0.1.0.tar.gz
+```
+
+> A dimension reduction method, POCRE, was used for an initial screening of genome-wide SNP markers. ...... it efficiently selects a set of important candidates from genome-wide SNPs that captures maximum association with the transcript levels. 
+
+```{r eval=FALSE}
+## POCRE.R
+## Note: run the fllowing code on node2 which has 2T RAM and 80 cores
+library(POCRE)
+library(data.table)
+library(doParallel)
+registerDoParallel(core=40)
+
+rna <- read.table('geo/gene_expression.tsv', header = T, row.names = 1)
+rna <- t(rna)
+
+snp <- as.matrix(fread('vcf/filtered_665_accession_snp_maf0.01_gene_matrix.012'))
+snp_pos <- read.table('vcf/filtered_665_accession_snp_maf0.01_gene_matrix.012.pos')
+
+writeLines(c(""), "POCRE_log.txt")
+st <- system.time({
+  results <- foreach(i=1:ncol(rna)) %dopar% {
+    cat(paste("Starting iteration", i, "\n"), file = 'POCRE_log.txt', append = TRUE)
+    result <- pocrescreen(rna[, i, drop=F], snp)
+    snp_pos[result$retSIdx, ]
+  }
+})
+
+save(list = c('st', 'results'), file = 'RData/ROCRE.RData')
+```
+
+> The resulting markers were grouped based on gene annotations in TAIR10. SNPs in the same gene were grouped as one unit for association tests. 
+
+```{r}
+## group_SNP.set.R
+load('RData/ROCRE.RData')
+snp <- unique(do.call(rbind, results))
+bed <- data.frame(chr=snp$V1, start=snp$V2-1, end=snp$V2)
+bed <- bed[order(bed$chr, bed$start), ]
+write.table(bed, 'snp/SNP_candidates.bed', quote = F, sep = '\t', row.names = F, col.names = F)
+```
+
+```{bash}
+## postprocess SNP candidates
+bedtools intersect -a snp/SNP_candidates.bed -b tair10_gene_28775.bed -wa -wb|cut -f1-3,7|awk '{print $4"\t"$1":"$3}' > snp/SNP_candidates.SetID
+
+bedtools intersect -header -a vcf/filtered_665_accession_snp_maf0.01_gene.vcf.gz -b snp/SNP_candidates.bed|awk -F '\t' 'BEGIN {OFS = FS} {if($3==".") $3=$1":"$2; print $0}' > snp/SNP_candidates.vcf
+
+./bin/plink --vcf snp/SNP_candidates.vcf --make-bed --out plink/SNP_candidates
+```
+
+> The association tests were carried out using SKAT with transcript level of each gene as one phenotype (Ionita-Laza et al. 2013). SKAT is a flexible association test between a set of markers and a continuous or binary phenotype, allowing for natural and easy adjustment of covariates, such as population stratification correction. 
+
+```{bash}
+## make phenotype .fam files
+mkdir plink/fam
+grep '^AT' geo/gene_expression.tsv|cut -f1|parallel --gnu "./bin/plink --vcf snp/SNP_candidates.vcf --pheno geo/gene_expression_pheno.tsv --pheno-name {} --make-just-fam --out plink/fam/{}"
+rm plink/fam/*.log plink/fam/*.nosex
+```
+
+```{r eval=FALSE}
+## SKAT.R
+## Note: run the fllowing code on node2 which has 2T RAM and 80 cores
+library(SKAT)
+library(doParallel)
+registerDoParallel(core=40)
+
+# Generate SSD file
+File.Bed <- 'plink/SNP_candidates.bed'
+File.Bim <- 'plink/SNP_candidates.bim'
+File.Fam <- 'plink/SNP_candidates.fam'
+File.SetID <- 'snp/SNP_candidates.SetID'
+File.SSD <- 'plink/SNP_candidates.SSD'
+File.Info <- 'plink/SNP_candidates.SSD.info'
+Generate_SSD_SetID(File.Bed, File.Bim, File.Fam, File.SetID, File.SSD, File.Info)
+
+fam_files <- dir('plink/fam/', full.names = T)
+genes <- sub('.fam', '', dir('plink/fam'))
+
+writeLines(c(""), "SKAT_log.txt")
+st <- system.time({
+  results <- foreach(i=1:length(fam_files), .verbose = F) %dopar% {
+    cat(paste("Starting iteration", i, "\n"), file = 'SKAT_log.txt', append = TRUE)
+    
+    y <- Read_Plink_FAM(fam_files[i], Is.binary = FALSE)$Phenotype
+    obj <- SKAT_Null_Model(y ~ 1, out_type = 'C')
+    
+    # open SSD and Info file and run SKAT
+    SSD.INFO <- Open_SSD(File.SSD, File.Info)
+    out <- SKAT.SSD.All(SSD.INFO, obj)
+    Close_SSD()
+
+    out$results$transcript <- genes[i] 
+    out$results
+  }
+})
+
+save(list = c('st', 'results'), file = 'RData/SKAT.RData')
+```
+
+> A list of putative eQTL genes was generated by SKAT for each phenotype. To correct for multiple testing, eQTL genes with **BH-adjusted p-value** less than or equal to 0.05 in the list were considered as significantly associated with the expression level of the transcript. 
+
+```{r}
+## SKAT_postprocess.R
+## Note: run the fllowing code on node2 which has 2T RAM and 80 cores
+library(doParallel)
+registerDoParallel(core=20)
+load('RData/SKAT.RData')
+
+pvalue <- unlist(sapply(results, function(x){x$P.value}))
+pvalue_adj <- p.adjust(pvalue, method='BH')
+
+## BH-adjusted p-value cutoff is set to 5e-5 (0.00005)
+pvalue_cutoff <- max(pvalue[pvalue_adj < 5e-5])
+
+writeLines(c(""), "SKAT_postprocess_log.txt")
+st <- system.time({
+  results_sig <- foreach(i=1:length(results)) %dopar% {
+    cat(paste("Starting iteration", i, "\n"), file = 'SKAT_postprocess_log.txt', append = TRUE)
+    x <- results[[i]]
+    x <- x[x$P.value < pvalue_cutoff, c('SetID', 'transcript')]
+    t(x)
+  }
+})
+
+results_sig <- as.data.frame(t(do.call(cbind, results_sig)), stringsAsFactors=F)
+
+save(list = c('results_sig'), file = 'RData/SKAT_sig.RData')
+```
+
+# Result
+#### **Table 1. Summary of SKAT results**
+```{bash}
+bedtools window -a tair10_gene_28775.bed -b tair10_gene_28775.bed -w 20000|cut -f4,10 > tair10_gene_local_20kb
+```
+
+```{r}
+load('RData/SKAT_sig.RData')
+gene20kb <- read.table('tair10_gene_local_20kb')
+
+geo <- read.table('geo/gene_expression.tsv', header = T, row.names = 1)
+tmp <- merge(results_sig, gene20kb, by.x= 2, by.y = 1)
+local_eqtl <- tmp[tmp$SetID == tmp$V2,]
+
+total_gene <- c(Mitochondrion=length(grep('ATM', row.names(geo), value = T)),
+                Chloroplast=length(grep('ATC', row.names(geo), value = T)),
+                NuclearGenome=length(grep('AT[0-9]', row.names(geo), value = T)),
+                Total=nrow(geo))
+gene_with_eQTL <- c(Mitochondrion=length(table(grep('ATM', results_sig$transcript, value = T))),
+                    Chloroplast=length(table(grep('ATC', results_sig$transcript, value = T))),
+                    NuclearGenome=length(table(grep('AT[0-9]', results_sig$transcript, value = T))),
+                    Total=length(unique(results_sig$transcript)))
+gene_with_local_eQTL <- c(Mitochondrion=length(table(grep('ATM', local_eqtl$transcript, value = T))),
+                          Chloroplast=length(table(grep('ATC', local_eqtl$transcript, value = T))),
+                          NuclearGenome=length(table(grep('AT[0-9]', local_eqtl$transcript, value = T))),
+                          Total=length(unique(local_eqtl$transcript)))
+summary_table <- cbind(total_gene, gene_with_eQTL, gene_with_local_eQTL)
+print(summary_table)
+
+```
+
+#### **Figure 1. Distribution of the numbers of eQTL identified for each transcript**
+```{r}
+## Figure1.R
+y <- merge(as.data.frame(table(results_sig$transcript)),
+           as.data.frame(table(local_eqtl$transcript)-1),
+           by.x =1, by.y=1, all.x = T)
+y[is.na(y)] <- 0
+x <- y[,2] - y[,3]
+x[x>200] <- 210
+
+png('Figure1.png', wid=800, hei=400)
+h <- hist(x, main='', ylab='Frequency', xlab='Number of eQTL Genes Identified by One Transcript')
+text(h$mids[21], 2400, '>200')
+dev.off()
+```
+
+![](Figure1.png)
+
+#### **Figure 2. Genomic distribution of eQTL**
+```{bash}
+bedtools makewindows -g tair10.chromSize -w 50000 |awk '{print $0"\t"NR}' > tair10_50kb_windows.bed
+bedtools intersect -a tair10_gene_28775.bed -b tair10_50kb_windows.bed -wa -wb|cut -f4,10 > tair10_50kb_windows_genes
+```
+
+```{r eval=FALSE}
+## Figure2.R
+gene_loc <- read.table('tair10_gene_28775.bed')
+
+x1 <- merge(results_sig, gene_loc, by.x = 1, by.y = 4)[, 1:4]
+colnames(x1)[3:4] <- c('SetID.chrom', 'SetID.start')
+
+x2 <- merge(x1, gene_loc, by.x = 2, by.y = 4)[, 3:6]
+colnames(x2)[3:4] <- c('transcript.chrom', 'transcript.start')
+
+chrom_size <- c(30427671, 19698289, 23459830, 18585056, 26975502)
+offset <- c(0, cumsum(chrom_size))
+
+for (i in 1:5) {
+  x2$SetID.start[x2$SetID.chrom == i] <- x2$SetID.start[x2$SetID.chrom == i] + offset[i]
+  x2$transcript.start[x2$transcript.chrom == i] <- x2$transcript.start[x2$transcript.chrom == i] + offset[i]
+}
+
+png('Figure2A.png', wid=800, hei=800)
+plot(x2$SetID.start, x2$transcript.start, pch=16, cex=0.01, col='blue', xlab='Genomic Location of eQTL Genes', ylab='Genomic Location of Phenotypic Genes', xaxt='n', yaxt='n', bty='n')
+abline(h=offset, lwd=2)
+abline(v=offset, lwd=2)
+mtext(text=paste0('Chr', 1:5), side=1, at=offset[1:5]+diff(offset)/2)
+mtext(text=paste0('Chr', 1:5), side=2, at=offset[1:5]+diff(offset)/2)
+dev.off()
+```
+
+![](Figure2A.png)
+
+```{r}
+window_50kb <- read.table('tair10_50kb_windows_genes', stringsAsFactors = F)
+x3 <- merge(window_50kb, results_sig, by.x = 1, by.y = 1)
+dfm <- as.data.frame(table(x3$V2))
+
+win <- merge(data.frame(win=1:2385), dfm, by.x=1, by.y = 1, all.x = T)
+win[is.na(win)] <- 0
+
+png('Figure2B.png', wid=800, hei=400)
+plot(win$win, win$Freq, type = 'l', xlab='Genomic Location', ylab='Number of Associated Transcripts', col='gray', xaxt='n', las=2)
+abline(h=quantile(win$Freq, 0.99), col='red')
+window_50kb$chrom <- sub('G.+', 'G', window_50kb$V1)
+y <- sapply(split(window_50kb$V2, window_50kb$chrom), function(x){rev(x)[1]})
+abline(v=c(0,y))
+mtext(text=paste0('Chr', 1:5), side=1, at=diff(c(0,y))/2 + c(0, y[1:4]), line = 1)
+dev.off()
+```
+
+![](Figure2B.png)
+
+
+#### **Figure 3. Gene ontology enrichment of putative hotspot eQTL genes**
+```{r eval=FALSE}
+library(topGO)
+library(GO.db)
+
+topGO <- function(myGenes, category='BP', p_cutoff=0.05, gomap, geneid){
+  geneID2GO <- readMappings(file = gomap)
+  geneNames <- read.table(geneid, stringsAsFactors=F)$V1
+  geneList <- factor(as.integer(geneNames %in% myGenes))
+  names(geneList) <- geneNames
+  GOdata <- new("topGOdata", ontology=category, allGenes=geneList, annot=annFUN.gene2GO, gene2GO=geneID2GO)
+  resultFisher <- runTest(GOdata, algorithm = "weight", statistic = "fisher")
+  allRes <- GenTable(GOdata,pvalue=resultFisher,topNodes=100)
+  allRes$pvalue[grep('<',allRes$pvalue)] <- "1e-30"
+  allRes$pvalue <- as.numeric(allRes$pvalue)
+  allRes <- allRes[order(allRes$pvalue,decreasing=F),]
+  allRes$catagory <- category
+  allRes <- allRes[allRes$pvalue < p_cutoff, ]
+  allRes$Term <- apply(allRes, 1, function(x){Term(GOTERM[[x[1]]])})
+  return(allRes)
+}
+
+top1k <- names(sort(-table(results_sig$SetID))[1:1000])
+
+go <- topGO(top1k, gomap='tair10_gene2go.map', geneid='tair10_gene2go.geneid')
+```
+
+```{r}
+go[, c('Term', 'pvalue')]
+```
+
+
+#### **Figure 4. Nuclear eQTL gene hotspots for mitochondrial and chloroplastic transcripts.**
+```{r eval=F}
+## Figure4.R
+mito <- x2[grep('MG', x2$transcript), ]
+x4 <- merge(as.data.frame(table(mito$SetID)), gene_loc, by.x = 1, by.y = 4)[, 1:4]
+for (i in 1:5) {
+  x4$V2[x4$V1 == i] <- x4$V2[x4$V1 == i] + offset[i]
+}
+
+png('Figure4A.png', wid=800, hei=400)
+plot(x4$V2, x4$Freq, xlim=range(offset), xlab='', ylab='Number of Transcripts', xaxt='n', main=paste0('Mitochondrial Gene (n = ',length(unique(mito$transcript)),')'))
+abline(v=offset, lwd=2)
+mtext(text=paste0('Chr', 1:5), side=1, at=offset[1:5]+diff(offset)/2, line = 1)
+dev.off()
+```
+
+![](Figure4A.png)
+
+```{r}
+chlo <- x2[grep('CG', x2$transcript), ]
+x5 <- merge(as.data.frame(table(chlo$SetID)), gene_loc, by.x = 1, by.y = 4)[, 1:4]
+for (i in 1:5) {
+  x5$V2[x5$V1 == i] <- x5$V2[x5$V1 == i] + offset[i]
+}
+
+png('Figure4B.png', wid=800, hei=400)
+plot(x5$V2, x5$Freq, xlim=range(offset), xlab='', ylab='Number of Transcripts', xaxt='n', main=paste0('Chloroplastic Gene (n = ',length(unique(chlo$transcript)),')'))
+abline(v=offset, lwd=2)
+mtext(text=paste0('Chr', 1:5), side=1, at=offset[1:5]+diff(offset)/2, line = 1)
+dev.off()
+```
+
+![](Figure4B.png)
+
+
+# Reference
+Wang et al. Large-scale eQTL identification in Arabidopsis reveals novel candidate regulators of immune responses and other processes.
